@@ -1,0 +1,87 @@
+# Every push to main (merged pull request or direct push) tests, builds and publishes a new
+# GitHub release with the installer (Ruby-Setup-<version>.exe), the portable Ruby.exe and
+# their SHA-256 checksums.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release -p ruby
+
+      - name: Compute release tag
+        id: meta
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' crates/app/Cargo.toml | cut -d'"' -f2)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Get Inno Setup (portable, pinned)
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "innosetup.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "innosetup"
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/tools.innosetup/6.7.3/tools.innosetup.6.7.3.nupkg" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir
+          Join-Path $dir "tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build installer
+        shell: pwsh
+        run: ISCC.exe /Q "/DAppVersion=${{ steps.meta.outputs.version }}" installer/ruby.iss
+
+      - name: Package
+        shell: bash
+        run: |
+          cp target/release/Ruby.exe dist/Ruby.exe
+          cd dist
+          sha256sum "Ruby-Setup-${{ steps.meta.outputs.version }}.exe" Ruby.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            "dist/Ruby-Setup-${{ steps.meta.outputs.version }}.exe" \
+            dist/Ruby.exe \
+            dist/SHA256SUMS.txt \
+            --target "${GITHUB_SHA}" \
+            --title "Ruby ${{ steps.meta.outputs.version }} (build ${GITHUB_RUN_NUMBER})" \
+            --generate-notes \
+            --latest
